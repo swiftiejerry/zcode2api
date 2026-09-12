@@ -6,6 +6,7 @@
   "type": "commonjs",
   "main": "solver.js",
   "dependencies": {
+    "https-proxy-agent": "^9.1.0",
     "jsdom": "^24.1.0"
   }
 }

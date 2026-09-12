@@ -1,7 +1,21 @@
-const { JSDOM, VirtualConsole } = require('jsdom');
+const { JSDOM, VirtualConsole, ResourceLoader } = require('jsdom');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const SCENE = process.argv[2] || '11xygtvd';
 const REGION = process.argv[3] || 'sgp';
 const PREFIX = process.argv[4] || 'no8xfe';
+
+// jsdom 的 ResourceLoader 不读 HTTP(S)_PROXY 环境变量。若环境里配了代理
+// （Docker 容器访问外网常需要走宿主机代理），必须显式挂 agent，否则
+// 加载 AliyunCaptcha.js 会直接失败，表现为求解器 exit 4。
+const PROXY = process.env.HTTPS_PROXY || process.env.https_proxy
+  || process.env.HTTP_PROXY || process.env.http_proxy;
+const agent = PROXY ? new HttpsProxyAgent(PROXY) : null;
+
+class ProxyResourceLoader extends ResourceLoader {
+  fetch(url, options) {
+    return super.fetch(url, { ...options, ...(agent ? { agent } : {}) });
+  }
+}
 
 const vc = new VirtualConsole();  // 静默 jsdom 噪声
 const html = `<!DOCTYPE html><html><head></head><body>
@@ -12,7 +26,7 @@ const html = `<!DOCTYPE html><html><head></head><body>
 const dom = new JSDOM(html, {
   url: 'https://zcode.z.ai/',
   runScripts: 'dangerously',
-  resources: 'usable',
+  resources: agent ? new ProxyResourceLoader() : 'usable',
   pretendToBeVisual: true,
   virtualConsole: vc,
   beforeParse(window) {
