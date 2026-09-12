@@ -39,8 +39,23 @@ MODEL_NAME_MAP = {
 # /v1/models 对外公布的可用模型
 AVAILABLE_MODELS = ["GLM-5.2", "GLM-5-Turbo"]
 
-# 命中以下信号则认为账号额度用完
-_EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
+# 命中以下信号则认为账号额度用完。
+# 只用足够具体的短语：单看 "quota"/"balance" 这类词会把模型名、无关报错
+# （例如 "failed to read user balance history"）也算成额度耗尽，误封健康账号。
+_EXHAUST_KEYWORDS = (
+    "insufficient balance",
+    "insufficient_quota",
+    "insufficient quota",
+    "quota exceeded",
+    "quota_exhausted",
+    "no quota",
+    "out of quota",
+    "balance is insufficient",
+    "余额不足",
+    "额度不足",
+    "额度已用完",
+    "额度用完",
+)
 
 
 def _detect_provider(body: dict, headers) -> str:
@@ -123,6 +138,19 @@ async def messages(request: Request):
     except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
 
+    # /v1/messages 的 body 必须是 JSON 对象。数组 / 字符串 / 数字 / null 都算非法请求，
+    # 不能带着它继续往下走——后面 body.get() 会抛 AttributeError 变成 500。
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request"}},
+            status_code=400,
+        )
+    if "messages" in body and not isinstance(body["messages"], list):
+        return JSONResponse(
+            {"error": {"message": "messages 必须是数组", "type": "invalid_request"}},
+            status_code=400,
+        )
+
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
     body = _normalize_body(body)
@@ -134,6 +162,7 @@ async def messages(request: Request):
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
 
     tried: set[str] = set()
+    is_stream = bool(body.get("stream"))
 
     for _ in range(MAX_ACCOUNT_ATTEMPTS):
         account = store.select(provider, skip_ids=tried)
@@ -142,7 +171,8 @@ async def messages(request: Request):
         tried.add(account.id)
         needs_captcha = provider == "zai" and account.mode == "jwt"
 
-        result = await _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha)
+        result = await _try_account(req_id, account, body, payload, incoming_headers, port,
+                                    needs_captcha, is_stream)
         if result is _NEXT_ACCOUNT:
             continue
         return result
@@ -156,8 +186,27 @@ async def messages(request: Request):
 
 _NEXT_ACCOUNT = object()
 
+# 事件循环只持有 task 的弱引用，不保留引用的话任务可能在跑完前被 GC 掉（额度刷新静默丢失）。
+# 另外并发请求会对同一个账号各起一个刷新任务，这里按 account.id 去重，避免连接数随并发量放大。
+_refresh_tasks: dict[str, asyncio.Task] = {}
 
-async def _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha):
+
+def _schedule_refresh(account: Account) -> None:
+    """后台刷新账号额度：按账号去重，并持有任务引用直到完成。"""
+    existing = _refresh_tasks.get(account.id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(_safe_refresh(account))
+    _refresh_tasks[account.id] = task
+
+    def _done(_t: asyncio.Task, _id: str = account.id) -> None:
+        if _refresh_tasks.get(_id) is _t:
+            _refresh_tasks.pop(_id, None)
+
+    task.add_done_callback(_done)
+
+
+async def _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha, is_stream=False):
     """尝试用单个账号转发，含验证码续期。返回 Response 或 _NEXT_ACCOUNT。"""
     for attempt in range(MAX_CAPTCHA_RETRIES):
         verify_param = None
@@ -165,11 +214,11 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
             try:
                 verify_param = await captcha_manager.get_verify_param(port)
             except Exception as err:  # noqa: BLE001
-                logs.req_err(req_id, f"人机校验失败: {err}")
-                return JSONResponse(
-                    {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
-                    status_code=500,
-                )
+                # 求解器/Node 挂了是账号级问题（只在 jwt 账号上需要验证码），
+                # 不该把整个请求判 500——API Key 账号或其它账号仍然可用，交给上层换号。
+                _mark(account, Status.COOLING, f"人机校验不可用: {err}")
+                logs.warn(req_id, f"账号 {account.name} 人机校验不可用，切换下一个")
+                return _NEXT_ACCOUNT
 
         try:
             url, headers = build_request(account, body, verify_param, incoming_headers)
@@ -178,20 +227,46 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        # 流式请求要长时间保持连接，read=None 是必需的；但非流式请求如果也 read=None，
+        # 上游只建连不返包时会永远挂住（客户端一直等、连接和协程都不释放）。
+        # 非流式给一个有限的读超时，超时后走下面的 httpx.HTTPError 分支冷却换号。
+        read_timeout = None if is_stream else settings.UPSTREAM_READ_TIMEOUT
+        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=read_timeout, write=120.0, pool=30.0))
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()
+        except asyncio.CancelledError:
+            # 下游断开时 uvicorn 会取消本协程；CancelledError 是 BaseException，
+            # 不会被下面的 httpx.HTTPError 接住，必须自己确保连接池被关掉。
+            await client.aclose()
+            raise
         except httpx.HTTPError as err:
             await client.aclose()
             _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
             return _NEXT_ACCOUNT
+        except BaseException:
+            # 其它非 HTTPError 异常同样会跳过清理，这里兜底关闭，避免上游 socket 泄漏。
+            await client.aclose()
+            raise
 
         status_code = resp.status_code
 
         if status_code >= 400:
-            text = (await resp.aread()).decode("utf-8", "ignore")
+            try:
+                text = (await resp.aread()).decode("utf-8", "ignore")
+            except asyncio.CancelledError:
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                raise
+            except httpx.HTTPError:
+                # 上游在错误体中途断连（Content-Length 不符等）会在这里抛，
+                # 它不是 __aenter__ 那次捕获的范围，以前会直接泄漏 client。
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                _mark(account, Status.COOLING, "读取上游错误响应失败")
+                logs.warn(req_id, f"账号 {account.name} 读取上游响应失败，切换下一个")
+                return _NEXT_ACCOUNT
             await cm.__aexit__(None, None, None)
             await client.aclose()
 
@@ -203,7 +278,7 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
             if _is_exhausted(status_code, text):
                 _mark(account, Status.EXHAUSTED, "额度已用完")
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
-                asyncio.create_task(_safe_refresh(account))
+                _schedule_refresh(account)
                 return _NEXT_ACCOUNT
 
             if status_code in (401, 403):
@@ -231,7 +306,7 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
         store.update_account(account)
-        asyncio.create_task(_safe_refresh(account))
+        _schedule_refresh(account)
 
         content_type = resp.headers.get("content-type", "application/json")
 

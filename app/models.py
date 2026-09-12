@@ -92,7 +92,14 @@ class Account:
     def public_view(self) -> dict:
         """返回给前端的视图（脱敏 token）。"""
         secret = self.secret or ""
-        masked = secret if len(secret) <= 16 else f"{secret[:8]}…{secret[-6:]}"
+        # 16 字符以内的凭证以前走 "len <= 16 就原样返回" 的分支，等于把短 API Key
+        # 明文发给后台页面。短于 12 字符直接全部打码，其余保留首尾各 4 位。
+        if not secret:
+            masked = ""
+        elif len(secret) <= 12:
+            masked = "*" * len(secret)
+        else:
+            masked = f"{secret[:4]}…{secret[-4:]}"
         return {
             "id": self.id,
             "name": self.name,

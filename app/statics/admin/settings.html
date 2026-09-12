@@ -22,8 +22,8 @@
     <div class="section-title" style="margin-bottom:16px">鉴权</div>
     <div class="settings-row">
       <label>后台密码</label>
-      <div class="hint">用于登录此管理后台。修改后需用新密码重新登录。</div>
-      <input class="input" id="admin-key" type="text" placeholder="后台密码">
+      <div class="hint">用于登录此管理后台。留空表示不修改；修改后需用新密码重新登录。</div>
+      <input class="input" id="admin-key" type="password" placeholder="留空表示不修改" autocomplete="new-password">
     </div>
     <div class="settings-row">
       <label>网关 API Key（可选）</label>
@@ -66,7 +66,10 @@
 async function load(){
   try{
     const d=await api('GET','/settings');
-    document.getElementById('admin-key').value=d.admin_key||'';
+    // admin_key 不再回传明文：留空即不修改。placeholder 提示当前是否已设置。
+    const ak=document.getElementById('admin-key');
+    ak.value='';
+    ak.placeholder=d.admin_key_set?'留空表示不修改':'请输入后台密码';
     document.getElementById('gateway-key').value=d.gateway_key||'';
     document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
   }catch(e){showToast('加载失败: '+e.message,'error');}
@@ -76,12 +79,14 @@ async function saveSettings(){
   const admin_key=document.getElementById('admin-key').value.trim();
   const gateway_key=document.getElementById('gateway-key').value.trim();
   const quota_refresh_interval=parseInt(document.getElementById('quota-interval').value,10);
-  if(!admin_key)return showToast('后台密码不能为空','error');
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
+  const payload={gateway_key,quota_refresh_interval};
+  if(admin_key)payload.admin_key=admin_key;   // 留空 = 不改后台密码
   try{
-    await api('PUT','/settings',{admin_key,gateway_key,quota_refresh_interval});
-    await adminKey.set(admin_key);   // 同步本地保存，避免改密后被登出
+    await api('PUT','/settings',payload);
+    if(admin_key){await adminKey.set(admin_key);showToast('已保存，请用新密码重新登录','success');adminLogout();return;}
     showToast('已保存','success');
+    load();
   }catch(e){showToast('保存失败: '+e.message,'error');}
 }
 </script>

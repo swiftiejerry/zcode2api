@@ -68,8 +68,17 @@ async def add_accounts(payload: dict = Body(...)):
         raise HTTPException(400, "请输入至少一个 Token / API Key")
 
     added = []
+    existing_names = {a.name for a in store.list_accounts(provider)}
     for tok in dict.fromkeys(tokens):  # 去重保序
-        name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
+        name = (payload.get("name") or "").strip()
+        if not name:
+            # 用长度推导的名字在删除后会重复（比如删掉 zai-2 后下一个又叫 zai-2），
+            # 而 id/name 都可用于删除与查找，重名会让按名字的操作指向不确定的账号。
+            n = len(store.list_accounts(provider)) + 1
+            while f"{provider}-{n}" in existing_names:
+                n += 1
+            name = f"{provider}-{n}"
+        existing_names.add(name)
         acc = store.add_account(provider, name, tok)
         added.append(acc.id)
     # 立即刷新一次额度（仅 zai jwt）
@@ -205,11 +214,13 @@ async def login_poll(flow_id: str):
 # ── 设置 ─────────────────────────────────────────────────────────────────────
 @router.get("/settings")
 async def get_settings():
-    return {
-        "admin_key": store.admin_key(),
+    """返回后台设置。admin_key 不回传明文——需要改密时前端留空即为「不修改」。"""
+    settings_payload = {
         "gateway_key": store.gateway_key(),
         "quota_refresh_interval": store.quota_refresh_interval(),
+        "admin_key_set": bool(store.admin_key()),
     }
+    return JSONResponse(settings_payload, headers={"Cache-Control": "no-store"})
 
 
 @router.put("/settings")

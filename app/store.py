@@ -29,7 +29,7 @@ class Store:
         self._lock = threading.RLock()
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
-        self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        self._rotation: dict[str, str | None] = {p: None for p in PROVIDERS}
         self._init_db()
         self._load()
 
@@ -92,8 +92,14 @@ class Store:
             ).fetchall()
             for row in rows:
                 try:
-                    account = Account.from_dict(json.loads(row["data"]))
-                except (json.JSONDecodeError, TypeError):
+                    raw = json.loads(row["data"])
+                    # 单行数据损坏不能让整个进程起不来：以前一行 JSON 不是对象就会在
+                    # Account.from_dict 里抛 AttributeError，导致后续每次启动都崩，
+                    # 只能手工修库。逐行跳过坏数据即可。
+                    if not isinstance(raw, dict):
+                        continue
+                    account = Account.from_dict(raw)
+                except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
                     continue
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
@@ -203,8 +209,15 @@ class Store:
             return True
 
     def update_account(self, account: Account) -> None:
-        """持久化某个账号的当前状态。"""
+        """持久化某个账号的当前状态。
+
+        只对该 provider 下仍然存在的账号生效：请求会在 await 上游期间一直持有 Account
+        对象，若期间后台把该账号删了，等请求回来再落库会把整行重新写回去（已删账号复活，
+        重启后又出现在池子里）。这里先确认它还在内存表里，否则丢弃这次写入。
+        """
         with self._lock:
+            if not any(a.id == account.id for a in self._accounts.get(account.provider, [])):
+                return
             self._persist_account(account)
 
     def set_enabled(self, provider: str, id_or_name: str, enabled: bool) -> bool:
@@ -215,14 +228,22 @@ class Store:
             account.enabled = enabled
             if not enabled:
                 account.status = Status.DISABLED
-            elif account.status == Status.DISABLED:
+            elif account.status in (Status.DISABLED, Status.INVALID):
+                # 文档里的状态机写明 invalid 可由「重新启用」恢复，这里补上 INVALID，
+                # 否则账号一旦被标记 invalid 就再也回不到轮询池（enabled 已为 True）。
                 account.status = Status.ACTIVE
+                account.last_error = None
             self._persist_account(account)
             return True
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
     def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。
+
+        游标按「账号 id」推进而不是按池下标：同一请求里每次 select 的 pool 都会因为
+        skip_ids 变小，用下标取模会让游标反复落回池首（实测 3 个健康账号时永远只选到
+        第一个，其余账号被永久饿死）。按 id 推进后，下一轮会从上次选中者的下一个开始。
+        """
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:
@@ -232,9 +253,13 @@ class Store:
             ]
             if not pool:
                 return None
-            idx = self._rotation.get(provider, 0) % len(pool)
-            account = pool[idx]
-            self._rotation[provider] = (idx + 1) % len(pool)
+            last = self._rotation.get(provider)
+            if last is None:
+                account = pool[0]
+            else:
+                idx = next((i for i, a in enumerate(pool) if a.id == last), None)
+                account = pool[0] if idx is None else pool[(idx + 1) % len(pool)]
+            self._rotation[provider] = account.id
             return account
 
     # ── 导入 / 导出 ─────────────────────────────────────────────────────────
@@ -254,11 +279,16 @@ class Store:
 
     def import_accounts(self, payload: dict) -> int:
         providers = payload.get("providers", {})
+        if not isinstance(providers, dict):
+            return 0
         count = 0
         for provider, items in providers.items():
             if provider not in PROVIDERS or not isinstance(items, list):
                 continue
             for it in items:
+                # 导入文件是外部输入，可能夹带 null / 字符串等非对象项，逐项校验后再用。
+                if not isinstance(it, dict):
+                    continue
                 secret = it.get("secret") or it.get("token") or it.get("jwtToken") or it.get("apiKey")
                 if not secret:
                     continue

@@ -89,27 +89,38 @@ class CaptchaManager:
             raise RuntimeError(
                 f"未找到求解器 {settings.CAPTCHA_SOLVER_JS}，请先在 captcha_node 下执行 npm install"
             )
-        proc = await asyncio.create_subprocess_exec(
-            settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS), scene, region, prefix,
-            cwd=str(settings.CAPTCHA_SOLVER_DIR),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+            proc = await asyncio.create_subprocess_exec(
+                settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS), scene, region, prefix,
+                cwd=str(settings.CAPTCHA_SOLVER_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as err:
+            # 进程创建本身就会抛 FileNotFoundError，必须在 try 内；否则这个分支永远进不来，
+            # 只会拿到底层的 "[Errno 2] No such file or directory" 并被无意义地重试 4 次。
+            raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
+                await proc.wait()
             except ProcessLookupError:
                 pass
             return None
-        except FileNotFoundError as err:
-            raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
 
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 return line[len("VERIFY_PARAM="):].strip()
-        return None
+
+        # 没有 VERIFY_PARAM 时把 stderr / 退出码带出来，否则 jsdom 缺失之类的
+        # 真实原因（solver.js 里 require('jsdom') 失败）会被完全吞掉，
+        # 使用者只看到一句「求解失败」，无从排查。
+        detail = (stderr or b"").decode("utf-8", "ignore").strip()
+        if detail:
+            raise RuntimeError(f"求解器无输出（exit={proc.returncode}）: {detail[-400:]}")
+        raise RuntimeError(f"求解器无输出（exit={proc.returncode}）")
 
     def invalidate(self) -> None:
         self._cached = None

@@ -61,6 +61,8 @@ CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时�
 QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 # 限流（cooling）冷却时长（秒）
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# 非流式上游请求的读超时（秒）。流式仍为不限制，以免长回复被截断。
+UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 300)
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 UPSTREAM = {

@@ -18,6 +18,18 @@ _DROP_HEADERS = {
     "http-referer",
     "accept-encoding",
     "connection",
+    "content-type",
+    "cookie",
+}
+
+# 网关自己设置的、客户端一律不许覆盖的协议头
+_PROTECTED_HEADERS = {
+    "content-type",
+    "anthropic-version",
+    "http-referer",
+    "x-aliyun-captcha-verify-param",
+    "x-zcode-app-version",
+    "x-zcode-agent",
 }
 
 
@@ -59,10 +71,16 @@ def build_request(
     if verify_param:
         headers["X-Aliyun-Captcha-Verify-Param"] = verify_param
 
+    # 网关自己的头用小写名登记，避免与客户端传进来的同名不同大小写产生重复 header
+    # （httpx 按原文大小写区分，重复项会被上游合成成 "真值, 伪造值"）。
+    reserved = {k.lower() for k in headers}
+
     for key, value in (incoming_headers or {}).items():
         lower = key.lower()
-        if lower in _DROP_HEADERS or lower.startswith("x-zcode"):
+        if lower in _DROP_HEADERS or lower in _PROTECTED_HEADERS or lower in reserved:
             continue
-        headers[key] = value
+        if lower.startswith("x-zcode") or lower.startswith("x-aliyun-captcha"):
+            continue
+        headers[lower] = value
 
     return target_url, headers

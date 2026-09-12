@@ -24,6 +24,20 @@ def _auth_headers(account: Account) -> dict:
     return headers
 
 
+def _units(value):
+    """把上游的额度数字转成可比较的数值；非数值（字符串、None、对象）返回 None。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 async def fetch_quota(account: Account) -> dict:
     """拉取单个账号的 方案 / 余额 / 用量，写回账号状态并持久化。
 
@@ -73,11 +87,13 @@ async def fetch_quota(account: Account) -> dict:
             data = balance_res.json()
             result["balance"] = data
             for bal in (data.get("data") or {}).get("balances") or []:
+                if not isinstance(bal, dict):
+                    continue
                 name = bal.get("show_name") or bal.get("model") or "model"
                 quota_map[name] = {
-                    "total": bal.get("total_units"),
-                    "used": bal.get("used_units"),
-                    "remaining": bal.get("remaining_units"),
+                    "total": _units(bal.get("total_units")),
+                    "used": _units(bal.get("used_units")),
+                    "remaining": _units(bal.get("remaining_units")),
                     "expires_at": bal.get("expires_at"),
                 }
         except (ValueError, KeyError):
@@ -96,11 +112,13 @@ async def fetch_quota(account: Account) -> dict:
         remainings = [
             q.get("remaining") for q in quota_map.values() if q.get("remaining") is not None
         ]
-        if remainings and all((r or 0) <= 0 for r in remainings):
+        if remainings and all(r <= 0 for r in remainings):
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
-        elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
-            # 额度恢复 → 重新激活
+        elif account.status == Status.EXHAUSTED:
+            # 只有 exhausted 才由额度刷新恢复。COOLING 有冷却窗口，不能被一次额度查询
+            # 提前解锁（否则 429 刚标记完，下一轮刷新就放回池子继续被限流）；
+            # INVALID 是凭证失效，只能靠改凭证 / 手动重新启用来恢复。
             account.status = Status.ACTIVE
             account.last_error = None
             account.cooling_until = None
@@ -167,6 +185,9 @@ class QuotaMonitor:
     async def stop(self) -> None:
         self._stop.set()
         if self._task:
+            # 直接取消：只设 stop 事件的话，若此刻正卡在 refresh_accounts 里，
+            # 关闭流程要等整轮上游请求（每个 20s 超时）跑完才返回。
+            self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
