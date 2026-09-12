@@ -89,8 +89,17 @@ async def fetch_quota(account: Account) -> dict:
             for bal in (data.get("data") or {}).get("balances") or []:
                 if not isinstance(bal, dict):
                     continue
+                # 同一个 show_name 会有多个桶（例如 GLM-5.3-Flash 来自 Global Build /
+                # Weekend Build / Start Plan 三个方案），用 show_name 当 key 会互相覆盖，
+                # 把大额的一次性池子在 UI 上抹掉。改用 bucket_id 保证一桶一项，
+                # 并保留 show_name / priority 供展示与排序。
+                bucket_id = bal.get("bucket_id") or bal.get("entitlement_id") or bal.get("show_name")
                 name = bal.get("show_name") or bal.get("model") or "model"
-                quota_map[name] = {
+                quota_map[str(bucket_id)] = {
+                    "name": name,
+                    "plan_id": bal.get("plan_id"),
+                    "priority": bal.get("priority"),
+                    "capabilities": bal.get("capabilities") or [],
                     "total": _units(bal.get("total_units")),
                     "used": _units(bal.get("used_units")),
                     "remaining": _units(bal.get("remaining_units")),
@@ -108,11 +117,17 @@ async def fetch_quota(account: Account) -> dict:
 
     if quota_map:
         account.quota = quota_map
-        # 额度用完判定：所有模型剩余 <= 0
-        remainings = [
-            q.get("remaining") for q in quota_map.values() if q.get("remaining") is not None
+        # 额度用完判定：把所有「未过期且剩余 > 0」的桶视为可用额度。
+        # 以前是 all(remaining <= 0)，在多桶（同模型多方案）下会把已过期桶的
+        # 剩余额度也算进来，导致明明还有一个可用池子却被误判为耗尽并摘出轮询。
+        now_ts = time.time()
+        usable = [
+            q for q in quota_map.values()
+            if (q.get("remaining") or 0) > 0
+            and (q.get("expires_at") is None or q["expires_at"] > now_ts)
         ]
-        if remainings and all(r <= 0 for r in remainings):
+        checked = [q for q in quota_map.values() if q.get("remaining") is not None]
+        if checked and not usable:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
         elif account.status == Status.EXHAUSTED:

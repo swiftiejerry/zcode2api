@@ -27,17 +27,28 @@ router = APIRouter()
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 
-# Z.AI 上游模型名大小写敏感
+# Z.AI 上游模型名（大小写敏感）。以 ZCode 客户端实际在用的名字为准：
+# 日志 / config.json 里只有 glm-5.3 与 glm-5.3-flash 两个真实模型。
 MODEL_NAME_MAP = {
+    "glm-5.3": "GLM-5.3",
+    "glm-5.3-flash": "GLM-5.3-Flash",
     "glm-5.2": "GLM-5.2",
     "glm-5-turbo": "GLM-5-Turbo",
     "glm-turbo": "GLM-5-Turbo",
     "glm-5.1": "GLM-5.1",
     "glm-4.7": "GLM-4.7",
 }
+# Claude 客户端（Claude Code / Claude Desktop）直接发来的家族名兜底映射，
+# 避免 cc-switch 没配 routes 时把 claude-* 原样甩给 GLM 上游而 400。
+CLAUDE_FAMILY_ALIASES = {
+    "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5",
+    "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5-20251001",
+    "claude-3-5-sonnet", "claude-3-7-sonnet",
+}
+DEFAULT_UPSTREAM_MODEL = "GLM-5.3"
 
-# /v1/models 对外公布的可用模型
-AVAILABLE_MODELS = ["GLM-5.2", "GLM-5-Turbo"]
+# /v1/models 对外公布的可用模型（与上游实际存在的模型一致）
+AVAILABLE_MODELS = ["GLM-5.3", "GLM-5.3-Flash"]
 
 # 命中以下信号则认为账号额度用完。
 # 只用足够具体的短语：单看 "quota"/"balance" 这类词会把模型名、无关报错
@@ -70,8 +81,11 @@ def _normalize_body(body: dict) -> dict:
     if isinstance(model, str) and "/" in model:
         model = "/".join(model.split("/")[1:])
     if isinstance(model, str):
-        model = MODEL_NAME_MAP.get(model.lower(), model)
-        body["model"] = model
+        mapped = MODEL_NAME_MAP.get(model.lower())
+        if mapped is None and model.lower() in CLAUDE_FAMILY_ALIASES:
+            # Claude 客户端没被路由改写时，兜底成默认上游模型，避免把 claude-* 甩给 GLM 上游。
+            mapped = DEFAULT_UPSTREAM_MODEL
+        body["model"] = mapped or model
 
     messages = body.get("messages")
     if isinstance(messages, list):
