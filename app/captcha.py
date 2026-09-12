@@ -33,9 +33,13 @@ class CaptchaManager:
             return self._config_cache
         try:
             async with httpx.AsyncClient(timeout=15) as client:
+                # platform 必须是 "{os}-{arch}"（如 win32-x64）：上游对 platform=win32
+                # 直接返回 400 parameter error，网关会静默退回错误的默认 region(sgp)，
+                # 用错误 region 去求解验证码必然失败。
                 res = await client.get(
-                    "https://zcode.z.ai/api/v1/client/configs"
-                    "?app_version=3.0.0&platform=win32"
+                    "https://zcode.z.ai/api/v1/client/configs",
+                    params={"app_version": settings.APP_CLIENT_VERSION,
+                            "platform": settings.APP_PLATFORM},
                 )
             res.raise_for_status()
             captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
@@ -45,7 +49,7 @@ class CaptchaManager:
                 return captcha
         except (httpx.HTTPError, ValueError) as err:
             logs.warn("captcha", f"获取配置失败，使用默认: {err}")
-        return {"enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd"}
+        return dict(settings.CAPTCHA_FALLBACK_CONFIG)
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def get_verify_param(self, port: int | None = None) -> str:
@@ -85,13 +89,53 @@ class CaptchaManager:
         raise RuntimeError(f"验证码求解失败: {last_err or '多次重试无结果'}")
 
     async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:
-        if not settings.CAPTCHA_SOLVER_JS.exists():
+        # 优先走宿主机上的真实浏览器求解服务（容器里没有浏览器）。
+        if settings.CAPTCHA_SERVICE_URL:
+            try:
+                return await self._run_service(scene, region, prefix)
+            except Exception as err:  # noqa: BLE001
+                logs.warn("captcha", f"求解服务不可用，回退本地求解器: {err}")
+
+        # 本地：优先真实浏览器；jsdom 版会被阿里云设备指纹检测识别（直接走 fail 回调）。
+        candidates = []
+        if settings.CAPTCHA_SOLVER_CHROME_JS.exists():
+            candidates.append(settings.CAPTCHA_SOLVER_CHROME_JS)
+        if settings.CAPTCHA_SOLVER_JS.exists():
+            candidates.append(settings.CAPTCHA_SOLVER_JS)
+        if not candidates:
             raise RuntimeError(
                 f"未找到求解器 {settings.CAPTCHA_SOLVER_JS}，请先在 captcha_node 下执行 npm install"
             )
+        last_detail = ""
+        for script in candidates:
+            param, detail = await self._run_one(script, scene, region, prefix)
+            if param:
+                return param
+            last_detail = detail or last_detail
+        if last_detail:
+            raise RuntimeError(last_detail)
+        return None
+
+    async def _run_service(self, scene: str, region: str, prefix: str) -> str:
+        """调用宿主机上的求解服务（真实浏览器）。"""
+        async with httpx.AsyncClient(timeout=settings.CAPTCHA_SERVICE_TIMEOUT) as client:
+            res = await client.get(
+                settings.CAPTCHA_SERVICE_URL,
+                params={"scene": scene, "region": region, "prefix": prefix},
+            )
+        if res.status_code != 200:
+            raise RuntimeError(f"求解服务返回 HTTP {res.status_code}: {res.text[:200]}")
+        data = res.json()
+        param = (data or {}).get("param")
+        if not param:
+            raise RuntimeError(f"求解服务未返回参数: {(data or {}).get('error')}")
+        return param
+
+    async def _run_one(self, script, scene: str, region: str, prefix: str):
+        """跑一个求解器，返回 (param|None, 错误详情)。"""
         try:
             proc = await asyncio.create_subprocess_exec(
-                settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS), scene, region, prefix,
+                settings.NODE_PATH, str(script), scene, region, prefix,
                 cwd=str(settings.CAPTCHA_SOLVER_DIR),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -108,19 +152,19 @@ class CaptchaManager:
                 await proc.wait()
             except ProcessLookupError:
                 pass
-            return None
+            return None, "求解超时"
 
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
-                return line[len("VERIFY_PARAM="):].strip()
+                return line[len("VERIFY_PARAM="):].strip(), ""
 
         # 没有 VERIFY_PARAM 时把 stderr / 退出码带出来，否则 jsdom 缺失之类的
         # 真实原因（solver.js 里 require('jsdom') 失败）会被完全吞掉，
         # 使用者只看到一句「求解失败」，无从排查。
         detail = (stderr or b"").decode("utf-8", "ignore").strip()
         if detail:
-            raise RuntimeError(f"求解器无输出（exit={proc.returncode}）: {detail[-400:]}")
-        raise RuntimeError(f"求解器无输出（exit={proc.returncode}）")
+            return None, f"{script.name} 无输出（exit={proc.returncode}）: {detail[-400:]}"
+        return None, f"{script.name} 无输出（exit={proc.returncode}）"
 
     def invalidate(self) -> None:
         self._cached = None

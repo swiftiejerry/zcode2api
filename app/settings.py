@@ -53,6 +53,9 @@ CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
 CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / "solver.js"
+# 真实浏览器求解器（Chrome/Edge + CDP）。jsdom 版会被阿里云设备指纹识别直接 fail，
+# 本机有 Chrome/Edge 时优先用它。
+CAPTCHA_SOLVER_CHROME_JS = CAPTCHA_SOLVER_DIR / "solver_chrome.js"
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
 
@@ -83,5 +86,21 @@ UPSTREAM = {
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = "https://zcode.z.ai/api/v1/zcode-plan"
 
-USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", "ZCode/3.0.1")
+USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", "ZCode/3.11.2")
+UPSTREAM_USER_AGENT = USER_AGENT  # 兼容旧引用
 APP_VERSION = "2.0.0"
+
+# 伪装成 ZCode 客户端：client/configs 与 billing/balance 都校验 app_version，
+# 而 platform 必须是 "{os}-{arch}"（win32-x64），写成 win32 会被上游拒 400。
+APP_CLIENT_VERSION = os.getenv("ZCODE_CLIENT_APP_VERSION", "3.11.2")
+APP_PLATFORM = os.getenv("ZCODE_CLIENT_PLATFORM", "win32-x64")
+
+# 求解服务：真实浏览器在宿主机上，容器里没有。指向它即可让容器复用宿主机求解能力。
+CAPTCHA_SERVICE_URL = (os.getenv("ZCODE_CAPTCHA_SERVICE_URL", "") or "").strip()
+CAPTCHA_SERVICE_TIMEOUT = _int("ZCODE_CAPTCHA_SERVICE_TIMEOUT", 70)
+CAPTCHA_FALLBACK_CONFIG = {
+    "enabled": True,
+    "prefix": "no8xfe",
+    "region": os.getenv("ZCODE_CAPTCHA_REGION", "cn"),
+    "sceneId": "11xygtvd",
+}

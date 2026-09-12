@@ -48,9 +48,12 @@ async def fetch_quota(account: Account) -> dict:
     result: dict = {}
 
     async with httpx.AsyncClient(timeout=20) as client:
+        # billing/balance 必须带 app_version，否则上游返回 400 parameter error。
+        params = {"app_version": settings.APP_CLIENT_VERSION}
+
         async def _get(path: str):
             try:
-                return await client.get(f"{base}{path}", headers=headers)
+                return await client.get(f"{base}{path}", headers=headers, params=params)
             except httpx.HTTPError:
                 return None
 
